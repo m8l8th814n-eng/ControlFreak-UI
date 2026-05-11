@@ -8,6 +8,6 @@ put shit in PATH
 
 run freak --daemon(or dont!)
 
-run freakctl, or dont and run freak-ui
+run freakctl, or dont... run freak-ui
 
 
