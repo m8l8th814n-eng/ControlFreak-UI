@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""controlFREAK for handhelds — Qt wrapper around the `freak` daemon."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QFontDatabase
+from PyQt6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+SOCKET_PATH = "/tmp/controller.sucker"
+SERVICE_NAME = "freak"
+USER_UNIT_PATH = Path.home() / ".config/systemd/user/freak.service"
+OPENRC_INIT_PATH = Path("/etc/init.d/freak")
+
+PINK = "#ff50c8"
+PURPLE = "#a01ef0"
+BLUE = "#4664ff"
+LBLUE = "#8cc8ff"
+LGRAY = "#a0a0a0"
+BG = "#101015"
+BG2 = "#1a1a22"
+BG3 = "#262633"
+BORDER = "#3a3a4a"
+
+PARAM_COLORS = {
+    "red": "#ff9632",
+    "green": "#64f078",
+    "blue": "#508cff",
+    "contrast": "#ff50c8",
+    "gamma": "#ff50c8",
+}
+
+PARAM_ORDER = ["red", "green", "blue", "contrast", "gamma"]
+
+
+# ---------------------------------------------------------------------------
+# IPC client
+# ---------------------------------------------------------------------------
+
+class FreakClient:
+    def __init__(self, path: str = SOCKET_PATH):
+        self.path = path
+
+    def _send(self, cmd: str, timeout: float = 0.5) -> Optional[str]:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect(self.path)
+            s.sendall((cmd + "\n").encode())
+            data = b""
+            while b"\n" not in data:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            return data.decode().strip()
+        except (OSError, socket.timeout):
+            return None
+
+    def alive(self) -> bool:
+        return self._send("GET") is not None
+
+    def get(self) -> Optional[dict]:
+        r = self._send("GET")
+        if not r:
+            return None
+        try:
+            return json.loads(r)
+        except json.JSONDecodeError:
+            return None
+
+    def set(self, field: str, value: float) -> bool:
+        r = self._send(f"SET {field} {value:.1f}")
+        return r is not None and r.startswith("OK")
+
+    def reset(self) -> bool:
+        r = self._send("RESET")
+        return r is not None and r.startswith("OK")
+
+    def load(self, name: str) -> bool:
+        r = self._send(f"LOAD {name}")
+        return r is not None and r.startswith("OK")
+
+    def save(self, name: str) -> bool:
+        r = self._send(f"SAVE {name}")
+        return r is not None and r.startswith("OK")
+
+    def presets(self) -> list[str]:
+        r = self._send("PRESETS")
+        if not r:
+            return []
+        try:
+            return json.loads(r)
+        except json.JSONDecodeError:
+            return []
+
+
+# ---------------------------------------------------------------------------
+# Daemon manager
+# ---------------------------------------------------------------------------
+
+def detect_init() -> str:
+    if shutil.which("systemctl") and Path("/run/systemd/system").exists():
+        return "systemd"
+    if shutil.which("rc-service") or shutil.which("openrc"):
+        return "openrc"
+    return "none"
+
+
+def freak_binary() -> str:
+    for p in (
+        Path.home() / ".local/bin/freak",
+        Path("/usr/local/bin/freak"),
+        Path("/usr/bin/freak"),
+    ):
+        if p.is_file():
+            return str(p)
+    return "freak"
+
+
+def ensure_systemd_unit() -> None:
+    if USER_UNIT_PATH.exists():
+        return
+    USER_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    wayland = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+    USER_UNIT_PATH.write_text(
+        "[Unit]\n"
+        "Description=freak gamma daemon\n"
+        "After=graphical-session.target\n"
+        "PartOf=graphical-session.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={freak_binary()} --daemon\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        f"Environment=WAYLAND_DISPLAY={wayland}\n"
+        f"Environment=XDG_RUNTIME_DIR={runtime_dir}\n\n"
+        "[Install]\n"
+        "WantedBy=graphical-session.target\n"
+    )
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+
+
+class DaemonManager:
+    def __init__(self):
+        self.init = detect_init()
+
+    def is_running(self) -> bool:
+        if self.init == "systemd":
+            r = subprocess.run(
+                ["systemctl", "--user", "is-active", SERVICE_NAME],
+                capture_output=True, text=True,
+            )
+            return r.stdout.strip() == "active"
+        if self.init == "openrc" and OPENRC_INIT_PATH.exists():
+            r = subprocess.run(
+                ["rc-service", SERVICE_NAME, "status"],
+                capture_output=True, text=True,
+            )
+            return r.returncode == 0
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", f"{freak_binary()} --daemon"],
+                capture_output=True,
+            )
+            return r.returncode == 0
+        except FileNotFoundError:
+            return False
+
+    def start(self) -> tuple[bool, str]:
+        if self.init == "systemd":
+            ensure_systemd_unit()
+            r = subprocess.run(
+                ["systemctl", "--user", "enable", "--now", SERVICE_NAME],
+                capture_output=True, text=True,
+            )
+            ok = r.returncode == 0
+            return ok, (r.stderr or r.stdout).strip() or ("started" if ok else "failed")
+        if self.init == "openrc":
+            if not OPENRC_INIT_PATH.exists():
+                return False, "OpenRC init script /etc/init.d/freak saknas (kräver root)"
+            r = subprocess.run(
+                ["rc-service", SERVICE_NAME, "start"],
+                capture_output=True, text=True,
+            )
+            return r.returncode == 0, (r.stderr or r.stdout).strip()
+        try:
+            subprocess.Popen(
+                [freak_binary(), "--daemon"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True, "started directly (no init system detected)"
+        except OSError as e:
+            return False, str(e)
+
+    def stop(self) -> tuple[bool, str]:
+        if self.init == "systemd":
+            r = subprocess.run(
+                ["systemctl", "--user", "disable", "--now", SERVICE_NAME],
+                capture_output=True, text=True,
+            )
+            return r.returncode == 0, (r.stderr or r.stdout).strip()
+        if self.init == "openrc" and OPENRC_INIT_PATH.exists():
+            r = subprocess.run(
+                ["rc-service", SERVICE_NAME, "stop"],
+                capture_output=True, text=True,
+            )
+            return r.returncode == 0, (r.stderr or r.stdout).strip()
+        r = subprocess.run(["pkill", "-f", f"{freak_binary()} --daemon"])
+        return r.returncode == 0, "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Resolution (wlr-randr)
+# ---------------------------------------------------------------------------
+
+class ResolutionManager:
+    def __init__(self):
+        self.have = shutil.which("wlr-randr") is not None
+
+    def query(self) -> dict[str, dict]:
+        if not self.have:
+            return {}
+        try:
+            r = subprocess.run(
+                ["wlr-randr"], capture_output=True, text=True, timeout=2
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        outputs: dict[str, dict] = {}
+        current_output = None
+        for line in r.stdout.splitlines():
+            m = re.match(r'^(\S+)\s+"', line)
+            if m:
+                current_output = m.group(1)
+                outputs[current_output] = {"modes": [], "current": None}
+                continue
+            if current_output is None:
+                continue
+            m = re.match(
+                r"^\s+(\d+x\d+)\s+px,\s+([\d.]+)\s+Hz(.*)$", line
+            )
+            if m:
+                mode = f"{m.group(1)}@{float(m.group(2)):.3f}Hz"
+                outputs[current_output]["modes"].append(mode)
+                if "current" in m.group(3):
+                    outputs[current_output]["current"] = mode
+        return outputs
+
+    def set_mode(self, output: str, mode: str) -> tuple[bool, str]:
+        r = subprocess.run(
+            ["wlr-randr", "--output", output, "--mode", mode],
+            capture_output=True, text=True,
+        )
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+# ---------------------------------------------------------------------------
+# UI widgets
+# ---------------------------------------------------------------------------
+
+class ParamRow(QWidget):
+    changed = pyqtSignal(str, float)
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
+        self.color = PARAM_COLORS[name]
+        self._block = False
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 2, 8, 2)
+        lay.setSpacing(8)
+
+        self.label = QLabel(name.upper())
+        self.label.setMinimumWidth(80)
+        f = self.label.font()
+        f.setBold(True)
+        f.setPointSize(10)
+        self.label.setFont(f)
+        self.label.setStyleSheet(f"color: {self.color};")
+        lay.addWidget(self.label)
+
+        self.minus = QPushButton("−")
+        self.minus.setFixedSize(38, 38)
+        self.minus.setObjectName("paramBtn")
+        self.minus.clicked.connect(lambda: self._step(-1.0))
+        lay.addWidget(self.minus)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setObjectName(f"slider_{name}")
+        self.slider.setRange(0, 1000)
+        self.slider.setValue(800)
+        self.slider.setSingleStep(10)
+        self.slider.setPageStep(50)
+        self.slider.setMinimumHeight(40)
+        self.slider.valueChanged.connect(self._on_slider)
+        lay.addWidget(self.slider, 1)
+
+        self.plus = QPushButton("+")
+        self.plus.setFixedSize(38, 38)
+        self.plus.setObjectName("paramBtn")
+        self.plus.clicked.connect(lambda: self._step(1.0))
+        lay.addWidget(self.plus)
+
+        self.value_label = QLabel("80%")
+        self.value_label.setMinimumWidth(48)
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.value_label.setStyleSheet(f"color: {LGRAY}; font-weight: bold;")
+        lay.addWidget(self.value_label)
+
+        self._apply_slider_style()
+
+    def _apply_slider_style(self):
+        self.slider.setStyleSheet(
+            f"""
+            QSlider {{ height: 40px; }}
+            QSlider::groove:horizontal {{
+                height: 14px; background: {BG3};
+                border: 1px solid {BORDER}; border-radius: 7px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {self.color}; border-radius: 7px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 30px; height: 30px; margin: -10px 0;
+                background: {self.color};
+                border: 2px solid white; border-radius: 16px;
+            }}
+            QSlider::handle:horizontal:hover {{ border: 2px solid {PINK}; }}
+            """
+        )
+
+    def _on_slider(self, val: int):
+        pct = val / 10.0
+        self.value_label.setText(f"{pct:.0f}%")
+        if not self._block:
+            self.changed.emit(self.name, pct)
+
+    def _step(self, delta: float):
+        new = max(0.0, min(100.0, self.value() + delta))
+        self.set_value(new)
+        self.changed.emit(self.name, new)
+
+    def value(self) -> float:
+        return self.slider.value() / 10.0
+
+    def set_value(self, pct: float):
+        self._block = True
+        self.slider.setValue(int(round(pct * 10)))
+        self.value_label.setText(f"{pct:.0f}%")
+        self._block = False
+
+
+class TitleLabel(QLabel):
+    def __init__(self):
+        super().__init__()
+        html = (
+            f'<span style="color:{PINK}; font-weight:bold;">C</span>'
+            f'<span style="color:{PURPLE}; font-weight:bold;">O</span>'
+            f'<span style="color:{LBLUE}; font-weight:bold;">NTROL</span>'
+            f' '
+            f'<span style="color:{BLUE}; font-weight:bold;">F</span>'
+            f'<span style="color:{LBLUE}; font-weight:bold;">REAK</span>'
+            f' <span style="color:{LGRAY}; font-size:11px;">for handhelds</span>'
+        )
+        self.setText(html)
+        f = QFont()
+        f.setPointSize(16)
+        f.setBold(True)
+        self.setFont(f)
+        self.setTextFormat(Qt.TextFormat.RichText)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class ControlFreakWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("controlFREAK for handhelds")
+        self.setFixedSize(800, 400)
+
+        self.client = FreakClient()
+        self.daemon = DaemonManager()
+        self.resman = ResolutionManager()
+
+        self._build_ui()
+        self._apply_theme()
+        self._refresh_presets()
+        self._refresh_resolutions()
+        self._refresh_status()
+        self._pull_params(force=True)
+
+        self.poll = QTimer(self)
+        self.poll.setInterval(800)
+        self.poll.timeout.connect(self._poll)
+        self.poll.start()
+
+    # ---------- UI build ----------
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(4)
+
+        # title row
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.title = TitleLabel()
+        top.addWidget(self.title)
+        top.addStretch(1)
+
+        self.status_dot = QLabel("●")
+        self.status_dot.setStyleSheet("color: #555; font-size: 18px;")
+        top.addWidget(self.status_dot)
+        self.status_label = QLabel("checking…")
+        self.status_label.setStyleSheet(f"color: {LGRAY};")
+        top.addWidget(self.status_label)
+
+        self.btn_start = QPushButton("Start daemon")
+        self.btn_start.setObjectName("primaryBtn")
+        self.btn_start.clicked.connect(self._on_start)
+        top.addWidget(self.btn_start)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.clicked.connect(self._on_stop)
+        top.addWidget(self.btn_stop)
+
+        root.addLayout(top)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {BORDER};")
+        root.addWidget(sep)
+
+        # sliders
+        self.rows: dict[str, ParamRow] = {}
+        for name in PARAM_ORDER:
+            row = ParamRow(name)
+            row.changed.connect(self._on_param_change)
+            self.rows[name] = row
+            root.addWidget(row)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet(f"color: {BORDER};")
+        root.addWidget(sep2)
+
+        # presets row
+        prow = QHBoxLayout()
+        prow.setSpacing(6)
+        lab = QLabel("PRESET")
+        lab.setStyleSheet(f"color: {LBLUE}; font-weight: bold;")
+        prow.addWidget(lab)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumHeight(36)
+        self.preset_combo.setMinimumWidth(160)
+        prow.addWidget(self.preset_combo, 1)
+        self.btn_load = QPushButton("Load")
+        self.btn_load.clicked.connect(self._on_load_preset)
+        prow.addWidget(self.btn_load)
+        self.btn_save = QPushButton("Save as…")
+        self.btn_save.clicked.connect(self._on_save_preset)
+        prow.addWidget(self.btn_save)
+        self.btn_reset = QPushButton("Reset")
+        self.btn_reset.setObjectName("warnBtn")
+        self.btn_reset.clicked.connect(self._on_reset)
+        prow.addWidget(self.btn_reset)
+        root.addLayout(prow)
+
+        # resolution row
+        rrow = QHBoxLayout()
+        rrow.setSpacing(6)
+        lab2 = QLabel("DISPLAY")
+        lab2.setStyleSheet(f"color: {PINK}; font-weight: bold;")
+        rrow.addWidget(lab2)
+        self.output_combo = QComboBox()
+        self.output_combo.setMinimumHeight(36)
+        self.output_combo.currentIndexChanged.connect(self._on_output_change)
+        rrow.addWidget(self.output_combo)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setMinimumHeight(36)
+        rrow.addWidget(self.mode_combo, 1)
+        self.btn_apply_mode = QPushButton("Apply")
+        self.btn_apply_mode.setObjectName("primaryBtn")
+        self.btn_apply_mode.clicked.connect(self._on_apply_mode)
+        rrow.addWidget(self.btn_apply_mode)
+        self.btn_refresh_modes = QPushButton("↻")
+        self.btn_refresh_modes.setFixedWidth(40)
+        self.btn_refresh_modes.clicked.connect(self._refresh_resolutions)
+        rrow.addWidget(self.btn_refresh_modes)
+        root.addLayout(rrow)
+
+    def _apply_theme(self):
+        self.setStyleSheet(
+            f"""
+            QMainWindow, QWidget {{
+                background: {BG};
+                color: #e0e0e6;
+                font-size: 12px;
+            }}
+            QPushButton {{
+                background: {BG2};
+                color: #e0e0e6;
+                border: 1px solid {BORDER};
+                padding: 6px 14px;
+                border-radius: 6px;
+                min-height: 28px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                border-color: {PINK};
+                color: {LBLUE};
+            }}
+            QPushButton:pressed {{
+                background: {BG3};
+            }}
+            QPushButton#primaryBtn {{
+                background: {BG2};
+                border: 1px solid {BLUE};
+                color: {LBLUE};
+            }}
+            QPushButton#primaryBtn:hover {{
+                border-color: {PINK};
+                background: {BG3};
+            }}
+            QPushButton#warnBtn {{
+                border: 1px solid {PINK};
+                color: {PINK};
+            }}
+            QPushButton#paramBtn {{
+                font-size: 18px;
+                font-weight: bold;
+                padding: 0;
+                min-height: 36px;
+            }}
+            QComboBox {{
+                background: {BG2};
+                border: 1px solid {BORDER};
+                padding: 4px 10px;
+                border-radius: 6px;
+                color: {LBLUE};
+                font-weight: bold;
+            }}
+            QComboBox:hover {{ border-color: {PINK}; }}
+            QComboBox QAbstractItemView {{
+                background: {BG2};
+                color: #e0e0e6;
+                border: 1px solid {BORDER};
+                selection-background-color: {BG3};
+                selection-color: {LBLUE};
+            }}
+            QComboBox::drop-down {{ border: none; width: 24px; }}
+            QLabel {{ background: transparent; }}
+            """
+        )
+
+    # ---------- actions ----------
+
+    def _on_param_change(self, name: str, pct: float):
+        if not self.client.alive():
+            return
+        self.client.set(name, pct)
+
+    def _on_start(self):
+        ok, msg = self.daemon.start()
+        if not ok:
+            QMessageBox.warning(self, "Start failed", msg or "unknown error")
+        QTimer.singleShot(400, self._refresh_status)
+        QTimer.singleShot(800, lambda: self._pull_params(force=True))
+
+    def _on_stop(self):
+        ok, msg = self.daemon.stop()
+        if not ok:
+            QMessageBox.warning(self, "Stop failed", msg or "unknown error")
+        QTimer.singleShot(400, self._refresh_status)
+
+    def _on_reset(self):
+        if self.client.alive():
+            self.client.reset()
+            self._pull_params(force=True)
+        else:
+            for r in self.rows.values():
+                r.set_value(80.0)
+
+    def _on_load_preset(self):
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        if not self.client.alive():
+            QMessageBox.information(self, "Daemon offline", "Starta freak-daemonen först.")
+            return
+        if self.client.load(name):
+            self._pull_params(force=True)
+        else:
+            QMessageBox.warning(self, "Load failed", f"kunde inte ladda preset '{name}'")
+
+    def _on_save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Namn på preset:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if not self.client.alive():
+            QMessageBox.information(self, "Daemon offline", "Starta freak-daemonen först.")
+            return
+        if self.client.save(name):
+            self._refresh_presets(select=name)
+        else:
+            QMessageBox.warning(self, "Save failed", f"kunde inte spara preset '{name}'")
+
+    def _on_output_change(self):
+        if not hasattr(self, "_outputs") or not self._outputs:
+            return
+        out = self.output_combo.currentText()
+        info = self._outputs.get(out)
+        if not info:
+            return
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.clear()
+        for m in info["modes"]:
+            self.mode_combo.addItem(m)
+        if info["current"]:
+            i = self.mode_combo.findText(info["current"])
+            if i >= 0:
+                self.mode_combo.setCurrentIndex(i)
+        self.mode_combo.blockSignals(False)
+
+    def _on_apply_mode(self):
+        out = self.output_combo.currentText()
+        mode = self.mode_combo.currentText()
+        if not out or not mode:
+            return
+        wlr_mode = mode.replace("Hz", "")
+        ok, msg = self.resman.set_mode(out, wlr_mode)
+        if not ok:
+            QMessageBox.warning(self, "wlr-randr", msg or "failed")
+        QTimer.singleShot(300, self._refresh_resolutions)
+
+    # ---------- refresh ----------
+
+    def _refresh_presets(self, select: Optional[str] = None):
+        current = select or self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        names = self.client.presets() if self.client.alive() else []
+        if not names:
+            # fallback: read from disk
+            d = Path.home() / ".config/controlorfreak/presets"
+            if d.is_dir():
+                names = sorted(p.stem for p in d.glob("*.freak"))
+        for n in sorted(names):
+            self.preset_combo.addItem(n)
+        if current:
+            i = self.preset_combo.findText(current)
+            if i >= 0:
+                self.preset_combo.setCurrentIndex(i)
+        self.preset_combo.blockSignals(False)
+
+    def _refresh_resolutions(self):
+        if not self.resman.have:
+            self.output_combo.clear()
+            self.output_combo.addItem("(wlr-randr saknas)")
+            self.output_combo.setEnabled(False)
+            self.mode_combo.setEnabled(False)
+            self.btn_apply_mode.setEnabled(False)
+            return
+        self._outputs = self.resman.query()
+        prev_out = self.output_combo.currentText()
+        self.output_combo.blockSignals(True)
+        self.output_combo.clear()
+        for name in self._outputs:
+            self.output_combo.addItem(name)
+        if prev_out:
+            i = self.output_combo.findText(prev_out)
+            if i >= 0:
+                self.output_combo.setCurrentIndex(i)
+        self.output_combo.blockSignals(False)
+        self._on_output_change()
+
+    def _refresh_status(self):
+        alive = self.client.alive()
+        running = self.daemon.is_running()
+        if alive:
+            self.status_dot.setStyleSheet(f"color: {PARAM_COLORS['green']}; font-size: 18px;")
+            self.status_label.setText(f"daemon · {self.daemon.init}")
+        elif running:
+            self.status_dot.setStyleSheet(f"color: {PARAM_COLORS['contrast']}; font-size: 18px;")
+            self.status_label.setText(f"running, no IPC · {self.daemon.init}")
+        else:
+            self.status_dot.setStyleSheet(f"color: #555; font-size: 18px;")
+            self.status_label.setText(f"stopped · {self.daemon.init}")
+
+    def _pull_params(self, force: bool = False):
+        data = self.client.get()
+        if not data:
+            return
+        for name, row in self.rows.items():
+            if name in data:
+                v = float(data[name])
+                if force or abs(row.value() - v) > 0.05:
+                    row.set_value(v)
+
+    def _poll(self):
+        self._refresh_status()
+        self._pull_params()
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("controlFREAK")
+    w = ControlFreakWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
